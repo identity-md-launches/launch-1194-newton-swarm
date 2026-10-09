@@ -76,9 +76,12 @@ that `address & 0x3FFF == 0x20CC`. `HookMiner` in `test/utils/` shows the loop.
 **beforeInitialize** accepts exactly one pool: it must contain the launch token, use LP fee 12500 and
 tick spacing 60, and no pool may have been opened before (`AlreadyOpened`). It records the paired
 currency (the key's other currency, IMD at launch), the pool id and `openedAt = block.timestamp`.
-Anything else reverts with `NotLaunchPool`. The caller of `initialize` is not checked: the hook
-only has code once the factory deploys it, so the factory's own `initialize` is the first one that
-can reach it.
+Anything else reverts with `NotLaunchPool`. The caller of `initialize` and the paired token address
+are not checked. **Deployment and initialization must be atomic in the factory transaction**, with
+the manifest's IMD address. If deployment and initialization are split across transactions, anyone
+can initialize SNEWT against a different currency first and permanently bind the hook to that pool.
+The initialization callback prevents initializing the pool before the hook has code; it does not
+protect a deployed but uninitialized hook.
 
 ### The hook fee (M1)
 
@@ -98,8 +101,10 @@ fee. The LP fee is never dynamic and never overridden.
 `OPENING_FEE_BPS`, `STANDING_FEE_BPS` and `DECAY_SECONDS` are compile-time constants.
 
 **Definition.** The fee is `feeNow()` basis points of the IMD that actually moved through the pool
-in that swap: what the pool received on a buy, what the pool paid out on a sell. It is therefore
-always proportional to what filled.
+in that swap: what the pool received on a buy, what the pool paid out on a sell, subject to integer
+rounding. Unspecified-side fees round down. Specified-side reservations round up and are then
+scaled down on partial fills; the kept fee can exceed `floor(moved*bps/10000)` by up to two wei of
+IMD. For example, a two-wei exact-input buy at opening pays one wei to the pool and one wei in fees.
 
 | Swap | Specified side | How the fee is taken |
 | --- | --- | --- |
@@ -110,13 +115,33 @@ always proportional to what filled.
 
 **Reconciliation.** When the fee had to be reserved in `beforeSwap` (specified side is IMD), it is
 sized for a full fill. `afterSwap` reads the pool's real `BalanceDelta` on IMD; if less filled than
-reserved for (a price-limited partial fill), the fee kept is `reserved * moved / expected` and the
-difference is minted to the swap's `sender` as an ERC-6909 claim on the PoolManager. A partial fill
-therefore never pays more than the fee rate on what filled. Routers should expect to receive IMD
-claims in that case; the test routers forward them to the user. For a sell with exact output and a
-far price limit, the reservation can exceed the fill, so the sender's ERC-20 IMD delta can be
-negative while the refund claim covers it. The net result is still `fill - fee`, but the router must
-be able to settle IMD in that transaction.
+reserved for, the fee kept is `reserved * moved / expected`. The difference is minted as an ERC-6909
+claim on the PoolManager. Partial fills happen at price limits **and at exhausted liquidity bands,
+even with the full price limit**, including a launch pool seeded only with SNEWT.
+
+**Refund recipient.** Pass `hookData = abi.encode(refundRecipient)` (one 32-byte, nonzero ABI address)
+to mint the claim directly to the swapper or their chosen recipient. The swap router then needs no
+ERC-6909 handling to deliver that refund. Empty data, an encoded zero address, a noncanonical
+address word, or any other length falls back to `sender`, the PoolManager's caller, usually the
+router. This fallback preserves existing integrations; a delta-only router using it can strand
+refunds in its own balance. Use the explicit recipient with delta-only routers. The hook trusts the
+router to forward the intended destination; this data grants no permission over existing claims or
+other swaps. `FeeTaken.sender` remains the router, and `isBuy` follows the requested swap direction
+even if nothing fills.
+
+The fee bound counts the recipient's ERC-6909 claim as part of the refund and includes the rounding
+dust above. A claim is not an automatic ERC-20 payment. Its holder may transfer it, or approve a
+claim redeemer that unlocks the manager, burns the claim and takes IMD to the holder. The regression
+suite tests redemption independently of the swap router.
+
+**Exact-output sell settlement.** If the IMD fill is below the reservation, the returned IMD delta
+is `moved - reserved < 0`, even with an explicit refund recipient. The net result including the
+claim is `moved - kept`, but the seller must front IMD and the router must settle that negative delta
+in the same transaction, or use an authorized claim-burning settlement flow. A seller with no IMD
+using a delta-only router, or a router that only accepts a positive output delta (`TAKE_ALL` style),
+cannot complete this partial sell. This can occur with a close price limit or exhausted liquidity,
+including limited IMD liquidity early in launch. An exact-input sell charges on the actual IMD
+output in `afterSwap` and has no reservation or IMD pre-funding requirement.
 
 **Where the fee lives.** `afterSwap` mints the fee to the hook as an ERC-6909 claim
 (`poolManager.mint`). This needs no token balance in the manager, so the very first buy on the
@@ -130,10 +155,12 @@ to the treasury, `sweep()` would revert but swaps would be unaffected: fees keep
 The fee is deliberately kept in IMD, the pair currency, as the brief specifies; it is not converted
 to ETH.
 
-**Accepted revert domain.** The hook never reverts a real swap. The one exception is a specified
-amount that cannot be represented with the fee added in v4's 128-bit deltas: an absolute amount above
+**Large-request limitation.** The retained reservation mechanism rejects a specified IMD
+amount that cannot be represented with the full-fill fee in v4's 128-bit deltas: an absolute amount above
 `type(uint128).max`, or a reserved fee or expected pool amount above `type(int128).max` (for example
-`type(int256).max` or `type(int256).min`). Those revert with `UnrepresentableFee`. A one-wei swap is
+`type(int256).max` or `type(int256).min`). Those revert with `UnrepresentableFee`, including requests
+that a hookless pool could partially fill. This is stricter than the brief's int256-only overflow
+exception; changing it requires changing how specified-side fees are reserved. A one-wei swap is
 never turned into a zero-amount swap: if the net would be zero the fee is zero.
 
 ### Properties
@@ -144,8 +171,8 @@ never turned into a zero-amount swap: if the net would be zero the fee is zero.
   flags are off revert `HookNotImplemented` even for the PoolManager.
 - `sweep()` follows checks-effects-interactions and cannot run inside another unlock (the
   PoolManager refuses nested unlocks).
-- Runtime code 6.5 KB, creation code 7.4 KB plus two constructor words: far under EIP-170 and
-  EIP-3860.
+- Runtime code 6,583 bytes; initcode including both constructor words 7,586 bytes: far under
+  EIP-170 and EIP-3860.
 
 ## Deployment parameters and operational responsibilities
 
@@ -163,14 +190,18 @@ Operational notes:
 
 - **Nothing to configure after launch.** The hook has no owner and no setter. The treasury, fee
   schedule, pool fee and tick spacing are fixed in code; the PoolManager and token are immutables.
+- **CREATE2 salt.** Mine against the revised creation bytecode and the actual constructor arguments;
+  a salt calculated for earlier bytecode does not establish the new hook's permission bits.
 - **Sweeping** is permissionless. Someone (the treasury, a keeper, anyone) should call `sweep()`
   periodically; until then fees sit as the hook's ERC-6909 claim on the PoolManager, backed by the
   IMD swappers settled. Check `pending()` first to avoid a `NothingToSweep` revert.
 - **Opening window.** `openedAt` is set by the factory's `initialize` call, so the 60-minute decay
   starts at launch, not at hook deployment.
-- **Routers.** Any router works for full fills. Routers that submit price-limited exact-input buys
-  or exact-output sells should handle an IMD ERC-6909 claim refund (or use `settle`/`take` flows that
-  tolerate it).
+- **Routers.** Forward `abi.encode(refundRecipient)` for exact-input buys and exact-output sells,
+  or explicitly handle and forward the fallback refund claims. A full price limit does not guarantee
+  a full fill. Exact-output sells additionally require a router that can settle IMD in the same
+  transaction when the reservation exceeds the fill; choosing a recipient does not remove this
+  requirement. See the settlement constraints above.
 - **Swap gas.** Measured locally against a hookless pool with the same liquidity, a swap through
   the hook costs about 33k–42k gas more (two hook calls, one or two ERC-6909 mints and the fee
   arithmetic): 148k vs 113k for an exact-input buy, 154k vs 113k for an exact-output sell.
@@ -200,8 +231,13 @@ ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-con
 - `test/SNEWTHook.fork.t.sol`: the same deployment against the real PoolManager and real IMD on a
   Robinhood Chain fork: permission bits, initialize, the four swap shapes, partial-fill refunds and a
   sweep to the real treasury address. It skips cleanly (never passes silently) unless
-  `ROBINHOOD_RPC_URL` is set, because the verifier runs offline. All eight fork tests passed on
-  2026-10-09 at block 84,373,200 or later.
+  `ROBINHOOD_RPC_URL` is set, because the verifier runs offline. All nine fork tests, including the
+  new direct-refund regression, passed against the public Robinhood RPC during this revision.
+- Refund regressions in `test/SNEWTHook.t.sol` cover full-limit exhaustion of a SNEWT-only band,
+  direct claims and their redemption without the swap router, fuzzed price-limited buys/sells at
+  different fees, a separate recipient, malformed-data fallback, all four zero-fill event
+  directions, and the remaining IMD settlement requirement on partial exact-output sells. They run
+  for both token sort orders. The fork suite also checks direct refunds through a delta-only router.
 
 Local test fixtures (`test/utils/`): a mintable `MockERC20` standing in for IMD, `HookMiner`, and
 minimal `SwapRouter` / `LiquidityRouter` contracts that settle with the PoolManager and forward any
@@ -232,7 +268,7 @@ Licenses are kept next to each copy. Only `SNEWT` and `SNEWTHook` are deployed; 
 ## Assumptions and open points
 
 - The hook identifies the paired currency from the pool key rather than hardcoding IMD, so the same
-  bytecode would serve on any chain; the launch pairs it with IMD.
+  bytecode would serve on any chain; the factory must deploy and initialize it with IMD atomically.
 - The fee basis is the IMD leg of the pool's own delta. The brief says "same pattern as live launch
   #909" without giving its arithmetic; the definition above is the one implemented and tested.
 - `beforeInitialize` pins fee 12500 and tick spacing 60 because the brief fixes both. If the policy

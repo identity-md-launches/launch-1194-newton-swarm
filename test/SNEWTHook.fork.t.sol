@@ -16,6 +16,7 @@ import {SNEWT} from "../src/SNEWT.sol";
 import {SNEWTHook} from "../src/SNEWTHook.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {SwapRouter, LiquidityRouter} from "./utils/Routers.sol";
+import {DeltaSettlementRouter} from "./utils/DeltaSettlementRouter.sol";
 
 interface IERC20Meta {
     function symbol() external view returns (string memory);
@@ -190,5 +191,53 @@ contract SNEWTHookForkTest is Test {
         assertEq(imd.balanceOf(TREASURY) - treasuryBefore, due);
         assertEq(hook.pending(), 0);
         assertEq(hook.swept(), due);
+    }
+
+    function test_fork_directRefundsNeedNoRouterClaimsSupport() public {
+        openAndSeed();
+        DeltaSettlementRouter router = new DeltaSettlementRouter(manager);
+        token.approve(address(router), type(uint256).max);
+        imd.approve(address(router), type(uint256).max);
+        uint256 id = Currency.wrap(IMD).toId();
+        uint256 x = 10_000 ether;
+        uint256 bps = hook.feeNow();
+        uint256 before = imd.balanceOf(address(this));
+        uint256 reserved = x - x * BPS / (BPS + bps);
+
+        router.swap(
+            key,
+            SwapParams(!tokenIs0, -int256(x), nearLimit(!tokenIs0, 5)),
+            abi.encode(address(this)),
+            100_000 ether,
+            100_000 ether
+        );
+
+        uint256 paid = before - imd.balanceOf(address(this));
+        uint256 refund = manager.balanceOf(address(this), id);
+        uint256 moved = paid - reserved;
+        assertGt(refund, 0);
+        assertEq(manager.balanceOf(address(router), id), 0);
+        assertLe(paid - refund, moved + moved * bps / BPS + 2);
+
+        before = imd.balanceOf(address(this));
+        uint256 oldFee = hook.pending();
+        reserved = (x * bps + BPS - bps - 1) / (BPS - bps);
+        router.swap(
+            key,
+            SwapParams(tokenIs0, int256(x), nearLimit(tokenIs0, 5)),
+            abi.encode(address(this)),
+            100_000 ether,
+            100_000 ether
+        );
+
+        uint256 newRefund = manager.balanceOf(address(this), id) - refund;
+        int256 change = int256(imd.balanceOf(address(this))) - int256(before);
+        moved = uint256(change + int256(reserved));
+        uint256 fee = hook.pending() - oldFee;
+        assertGt(newRefund, 0);
+        assertEq(manager.balanceOf(address(router), id), 0);
+        assertEq(newRefund + fee, reserved);
+        assertLe(fee, moved * bps / BPS + 2);
+        assertEq(change + int256(newRefund), int256(moved - fee));
     }
 }

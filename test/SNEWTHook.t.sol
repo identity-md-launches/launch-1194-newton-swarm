@@ -22,6 +22,7 @@ import {SNEWTHook} from "../src/SNEWTHook.sol";
 import {MockERC20} from "./utils/MockERC20.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {SwapRouter, LiquidityRouter} from "./utils/Routers.sol";
+import {DeltaSettlementRouter, RefundClaimRedeemer} from "./utils/DeltaSettlementRouter.sol";
 
 /// @dev Calls `sweep()` from inside its own unlock, which the PoolManager must refuse.
 contract ReentrantSweeper is IUnlockCallback {
@@ -335,10 +336,27 @@ abstract contract SNEWTHookTestBase is Test {
     }
 
     function test_anyoneCanBeTheInitializer() public {
-        // The hook does not gate on who initializes: the mined address is only deployed by the factory.
+        // Safety depends on atomic deployment/initialization, not initializer authentication.
         vm.prank(alice);
         manager.initialize(key, SQRT_PRICE_1_1);
         assertEq(hook.openedAt(), block.timestamp);
+    }
+
+    function test_nonAtomicDeploymentAllowsForeignPairToBindFirst() public {
+        MockERC20 junk = new MockERC20("JUNK", "JUNK", 18);
+        bool first = address(token) < address(junk);
+        PoolKey memory foreign = PoolKey(
+            Currency.wrap(first ? address(token) : address(junk)),
+            Currency.wrap(first ? address(junk) : address(token)),
+            POOL_FEE,
+            TICK_SPACING,
+            IHooks(address(hook))
+        );
+        vm.prank(alice);
+        manager.initialize(foreign, SQRT_PRICE_1_1);
+        assertEq(Currency.unwrap(hook.paired()), address(junk));
+        vm.expectRevert(wrapped(IHooks.beforeInitialize.selector, SNEWTHook.AlreadyOpened.selector));
+        manager.initialize(key, SQRT_PRICE_1_1);
     }
 
     function test_initializeRefusesTheWrongLpFee() public {
@@ -565,6 +583,14 @@ abstract contract SNEWTHookTestBase is Test {
         swap(false, true, 1, 0);
     }
 
+    function test_twoWeiExactInputBuyKeepsOneWeiOfRoundingDust() public {
+        seedBothSides();
+        uint256 before = imd.balanceOf(address(this));
+        swap(true, true, 2, 0);
+        assertEq(before - imd.balanceOf(address(this)), 2);
+        assertEq(hook.pending(), 1);
+    }
+
     function test_lpFeeIsNeverOverridden() public {
         seedBothSides();
         swap(true, true, 100 ether, 0);
@@ -721,6 +747,158 @@ abstract contract SNEWTHookTestBase is Test {
 
     // ------------------------------------------------------------------ launch-like seeding
 
+    function refundRouter() internal returns (DeltaSettlementRouter router) {
+        router = new DeltaSettlementRouter(manager);
+        imd.mint(alice, 1_000_000 ether);
+        token.transfer(alice, 1_000_000 ether);
+        vm.startPrank(alice);
+        token.approve(address(router), type(uint256).max);
+        imd.approve(address(router), type(uint256).max);
+        vm.stopPrank();
+    }
+
+    function deltaOnlySwap(DeltaSettlementRouter router, bool buy, uint256 amount, uint160 limit, bytes memory data)
+        internal
+    {
+        bool zfo = zeroForOneFor(buy);
+        vm.prank(alice);
+        router.swap(
+            key, SwapParams(zfo, buy ? -int256(amount) : int256(amount), limit), data, 1_000_000 ether, 1_000_000 ether
+        );
+    }
+
+    function test_fullLimitBandExhaustionRefundReachesSwapperWithoutRouterClaimsSupport() public {
+        openPool();
+        (int24 lower, int24 upper) = tokenIs0 ? (int24(60), int24(6960)) : (int24(-6960), int24(-60));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(lower, upper, int256(LIQUIDITY), bytes32(0)));
+        DeltaSettlementRouter router = refundRouter();
+        uint256 before = imd.balanceOf(alice);
+        uint256 x = 1_000_000 ether;
+        (uint256 reserved, uint256 expected) = reservedBuy(x, hook.feeNow());
+
+        deltaOnlySwap(router, true, x, fullLimit(zeroForOneFor(true)), abi.encode(alice));
+
+        uint256 paid = before - imd.balanceOf(alice);
+        uint256 refund = claims(alice);
+        uint256 moved = paid - reserved;
+        assertGt(moved, 0);
+        assertLt(moved, expected, "full price limit still produced a partial fill");
+        assertGt(refund, 0);
+        assertEq(claims(address(router)), 0, "router never held the refund");
+        assertEq(refund + hook.pending(), reserved);
+        assertLe(paid - refund, moved + moved * hook.feeNow() / BPS + 2);
+
+        RefundClaimRedeemer redeemer = new RefundClaimRedeemer(manager);
+        vm.startPrank(alice);
+        manager.approve(address(redeemer), Currency.wrap(address(imd)).toId(), refund);
+        redeemer.redeem(Currency.wrap(address(imd)), refund);
+        vm.stopPrank();
+        assertEq(claims(alice), 0);
+        assertEq(before - imd.balanceOf(alice), moved + hook.pending(), "refund is spendable without the swap router");
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_explicitRecipientGetsPriceLimitedRefund(uint256 x, uint16 sqrtBps, uint32 elapsed, bool sell)
+        public
+    {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        x = bound(x, 1 ether, 200_000 ether);
+        sqrtBps = uint16(bound(sqrtBps, 1, 500));
+        vm.warp(block.timestamp + bound(elapsed, 0, 2 hours));
+        uint256 bps = hook.feeNow();
+        (uint256 reserved, uint256 expected) = sell ? reservedSell(x, bps) : reservedBuy(x, bps);
+        uint256 before = imd.balanceOf(alice);
+
+        deltaOnlySwap(router, !sell, x, nearLimit(zeroForOneFor(!sell), sqrtBps), abi.encode(alice));
+
+        int256 change = int256(imd.balanceOf(alice)) - int256(before);
+        uint256 moved = sell ? uint256(change + int256(reserved)) : uint256(-change) - reserved;
+        uint256 refund = claims(alice);
+        assertLe(moved, expected);
+        assertEq(claims(address(router)), 0);
+        assertEq(refund + hook.pending(), reserved);
+        assertLe(hook.pending(), moved * bps / BPS + 2);
+        int256 net = change + int256(refund);
+        assertEq(net, sell ? int256(moved - hook.pending()) : -int256(moved + hook.pending()));
+    }
+
+    function test_refundRecipientCanDifferFromPayer() public {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        address recipient = makeAddr("refundRecipient");
+        deltaOnlySwap(router, true, 10_000 ether, nearLimit(zeroForOneFor(true), 5), abi.encode(recipient));
+        assertGt(claims(recipient), 0);
+        assertEq(claims(alice), 0);
+        assertEq(claims(address(router)), 0);
+    }
+
+    function test_emptyZeroOrMalformedHookDataFallsBackToRouter() public {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        bytes[6] memory data = [
+            bytes(""),
+            abi.encode(address(0)),
+            abi.encode(type(uint256).max),
+            abi.encodePacked(alice),
+            abi.encode(alice, uint256(1)),
+            bytes(hex"01")
+        ];
+        uint256 snapshot = vm.snapshotState();
+        for (uint256 i; i < data.length; i++) {
+            deltaOnlySwap(router, true, 10_000 ether, nearLimit(zeroForOneFor(true), 5), data[i]);
+            assertGt(claims(address(router)), 0, "legacy fallback preserved");
+            assertEq(claims(alice), 0);
+            assertEq(claims(address(0)), 0, "zero recipient must not burn the refund");
+            assertTrue(vm.revertToState(snapshot));
+        }
+    }
+
+    function test_zeroFillEventsUseSwapDirectionForEveryShape() public {
+        openPool();
+        uint256 snapshot = vm.snapshotState();
+        for (uint256 i; i < 4; i++) {
+            bool buy = i < 2;
+            bool exactInput = i % 2 == 0;
+            uint256 refund;
+            if (buy && exactInput) (refund,) = reservedBuy(1000 ether, 4000);
+            if (!buy && !exactInput) (refund,) = reservedSell(1000 ether, 4000);
+            vm.expectEmit(true, true, true, true, address(hook));
+            emit FeeTaken(address(swapRouter), buy, 4000, 0, refund);
+            swap(buy, exactInput, 1000 ether, 0);
+            assertEq(hook.pending(), 0);
+            assertEq(claims(address(this)), refund);
+            assertTrue(vm.revertToState(snapshot));
+        }
+    }
+
+    function test_partialExactOutputSellStillRequiresImdSettlementWithDirectRefund() public {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        // A token-only seller cannot pay the negative IMD delta with this delta-only router.
+        uint256 aliceImd = imd.balanceOf(alice);
+        vm.prank(alice);
+        imd.transfer(address(this), aliceImd);
+        assertEq(imd.balanceOf(alice), 0);
+        bool zfo = zeroForOneFor(false);
+        SwapParams memory params = SwapParams(zfo, 10_000 ether, nearLimit(zfo, 5));
+        vm.prank(alice);
+        vm.expectRevert();
+        router.swap(key, params, abi.encode(alice), tokenIs0 ? 100_000 ether : 0, tokenIs0 ? 0 : 100_000 ether);
+        (uint256 reserved,) = reservedSell(10_000 ether, hook.feeNow());
+        imd.mint(alice, reserved);
+        vm.prank(alice);
+        router.swap(
+            key, params, abi.encode(alice), tokenIs0 ? 100_000 ether : reserved, tokenIs0 ? reserved : 100_000 ether
+        );
+        uint256 moved = imd.balanceOf(alice);
+        assertGt(moved, 0);
+        assertLt(moved, reserved);
+        assertEq(claims(address(router)), 0);
+        assertEq(claims(alice), reserved - hook.pending());
+        assertEq(imd.balanceOf(alice) + claims(alice) - reserved, moved - hook.pending());
+    }
+
     function test_firstBuyOnATokenOnlyPoolAccruesWithoutAnyImdInTheManager() public {
         seedTokenOnly();
         uint256 x = 1000 ether;
@@ -839,6 +1017,26 @@ abstract contract SNEWTHookTestBase is Test {
         swapRouter.swap(key, SwapParams(zeroForOne, type(int256).min, fullLimit(zeroForOne)));
         vm.expectRevert(wrapped(IHooks.beforeSwap.selector, SNEWTHook.UnrepresentableFee.selector));
         swapRouter.swap(key, SwapParams(zeroForOne, -int256(uint256(type(uint128).max) + 1), fullLimit(zeroForOne)));
+    }
+
+    function test_reservationDomainRejectsAHugeRequestThatAHooklessPoolPartiallyFills() public {
+        seedBothSides();
+        bool zfo = zeroForOneFor(true);
+        SwapParams memory params = SwapParams(zfo, -int256(1 << 128), nearLimit(zfo, 5));
+        vm.expectRevert(wrapped(IHooks.beforeSwap.selector, SNEWTHook.UnrepresentableFee.selector));
+        swapRouter.swap(key, params);
+
+        PoolKey memory bare = key;
+        bare.hooks = IHooks(address(0));
+        manager.initialize(bare, SQRT_PRICE_1_1);
+        lpRouter.modifyLiquidity(
+            bare, ModifyLiquidityParams(FULL_RANGE_LOWER, FULL_RANGE_UPPER, int256(LIQUIDITY), bytes32(0))
+        );
+        uint256 before = imd.balanceOf(address(this));
+        swapRouter.swap(bare, params);
+        uint256 moved = before - imd.balanceOf(address(this));
+        assertGt(moved, 0);
+        assertLt(moved, 1000 ether);
     }
 
     function test_sellExactOutputJustBelowTheInt128LimitStillReservesOrRevertsCleanly() public {

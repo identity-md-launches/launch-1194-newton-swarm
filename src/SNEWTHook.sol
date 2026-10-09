@@ -40,8 +40,10 @@ import {ModifyLiquidityParams, SwapParams} from "../vendor/v4-core/src/types/Poo
 ///
 ///      When the fee had to be reserved on the specified side, beforeSwap sizes it for a full
 ///      fill. afterSwap then scales it down by the fraction that actually filled and refunds the
-///      excess to the swap's sender as an ERC-6909 claim, so a price-limited partial fill never
-///      pays more than the fee rate on what filled.
+///      excess as an ERC-6909 claim. Routers can pass `abi.encode(refundRecipient)` as hookData
+///      to credit the swapper directly; otherwise the claim goes to the PoolManager's caller
+///      (usually the router). The fee bound includes this claim and integer rounding dust.
+///      Exact-output sells can require IMD settlement when the reservation exceeds the fill.
 ///
 ///      No owner, no setters, no proxy, no delegatecall, no selfdestruct. Every parameter is a
 ///      compile-time constant or an immutable fixed at construction.
@@ -252,45 +254,58 @@ contract SNEWTHook is IHooks, IUnlockCallback {
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
-        bytes calldata
+        bytes calldata hookData
     ) external onlyPoolManager returns (bytes4, int128) {
         int128 pairedDelta = paired == key.currency0 ? delta.amount0() : delta.amount1();
+        // Direction remains meaningful even when no liquidity fills and both deltas are zero.
+        bool isBuy = params.zeroForOne == (paired == key.currency0);
         if (_specifiedIsPaired(key, params)) {
-            _reconcile(sender, params.amountSpecified, pairedDelta);
+            _reconcile(sender, _refundRecipient(sender, hookData), params.amountSpecified, pairedDelta, isBuy);
             return (IHooks.afterSwap.selector, 0);
         }
-        return (IHooks.afterSwap.selector, _charge(sender, pairedDelta));
+        return (IHooks.afterSwap.selector, _charge(sender, pairedDelta, isBuy));
     }
 
     // ---------------------------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------------------------
 
-    /// @dev Splits the pool's delta on the paired currency into direction and magnitude.
-    ///      Negative: the swapper paid IMD into the pool (a buy). Positive: the pool paid IMD out (a sell).
-    function _moved(int128 pairedDelta) internal pure returns (bool isBuy, uint256 moved) {
-        isBuy = pairedDelta < 0;
-        moved = isBuy ? uint256(uint128(-pairedDelta)) : uint256(uint128(pairedDelta));
+    /// @dev Accept a single canonical, nonzero ABI-encoded address. Empty, unrelated or malformed
+    ///      hookData keeps the legacy sender destination without introducing a swap revert.
+    ///      This is a destination supplied by the router, not authenticated user identity.
+    function _refundRecipient(address sender, bytes calldata hookData) internal pure returns (address) {
+        if (hookData.length == 32) {
+            uint256 word = uint256(bytes32(hookData));
+            if (word != 0 && word <= type(uint160).max) return address(uint160(word));
+        }
+        return sender;
+    }
+
+    /// @dev Magnitude of the pool's actual paired-currency delta; direction comes from SwapParams.
+    function _moved(int128 pairedDelta) internal pure returns (uint256) {
+        return pairedDelta < 0 ? uint256(-int256(pairedDelta)) : uint256(int256(pairedDelta));
     }
 
     /// @dev The paired currency is the unspecified side: charge the fee through the afterSwap
     ///      return delta, proportional to what the pool actually moved.
-    function _charge(address sender, int128 pairedDelta) internal returns (int128) {
-        (bool isBuy, uint256 moved) = _moved(pairedDelta);
+    function _charge(address sender, int128 pairedDelta, bool isBuy) internal returns (int128) {
+        uint256 moved = _moved(pairedDelta);
         uint256 bps = feeNow();
         uint256 fee = (moved * bps) / BPS; // fee <= moved <= int128.max
-        _accrue(sender, isBuy, bps, fee, 0);
+        _accrue(sender, sender, isBuy, bps, fee, 0);
         return int128(uint128(fee));
     }
 
     /// @dev The paired currency was the specified side: beforeSwap reserved a fee sized for a full
-    ///      fill of `expected`. Scale it to what actually moved and refund the rest to the sender.
-    function _reconcile(address sender, int256 amountSpecified, int128 pairedDelta) internal {
-        (bool isBuy, uint256 moved) = _moved(pairedDelta);
+    ///      fill of `expected`. Scale it to what actually moved and refund the chosen recipient.
+    function _reconcile(address sender, address refundRecipient, int256 amountSpecified, int128 pairedDelta, bool isBuy)
+        internal
+    {
+        uint256 moved = _moved(pairedDelta);
         uint256 bps = feeNow();
         (uint256 reserved, uint256 expected) = _reservedFee(amountSpecified, bps);
         uint256 kept = moved >= expected ? reserved : (reserved * moved) / expected;
-        _accrue(sender, isBuy, bps, kept, reserved - kept);
+        _accrue(sender, refundRecipient, isBuy, bps, kept, reserved - kept);
     }
 
     /// @dev True when the swap's specified amount is denominated in the paired currency.
@@ -334,16 +349,18 @@ contract SNEWTHook is IHooks, IUnlockCallback {
         }
     }
 
-    /// @dev Books `fee` as a claim for the hook and `refund` as a claim for the swap's sender.
+    /// @dev Books `fee` as a claim for the hook and `refund` as a claim for the chosen recipient.
     ///      Both are minted here while the hook is still being credited: once afterSwap returns the
     ///      PoolManager credits the hook `fee + refund`, which nets the hook's delta to zero.
-    function _accrue(address sender, bool isBuy, uint256 bps, uint256 fee, uint256 refund) internal {
+    function _accrue(address sender, address refundRecipient, bool isBuy, uint256 bps, uint256 fee, uint256 refund)
+        internal
+    {
         uint256 id = paired.toId();
         if (fee != 0) {
             _collected += fee;
             poolManager.mint(address(this), id, fee);
         }
-        if (refund != 0) poolManager.mint(sender, id, refund);
+        if (refund != 0) poolManager.mint(refundRecipient, id, refund);
         emit FeeTaken(sender, isBuy, bps, fee, refund);
     }
 
