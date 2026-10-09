@@ -828,9 +828,96 @@ abstract contract SNEWTHookTestBase is Test {
         DeltaSettlementRouter router = refundRouter();
         address recipient = makeAddr("refundRecipient");
         deltaOnlySwap(router, true, 10_000 ether, nearLimit(zeroForOneFor(true), 5), abi.encode(recipient));
-        assertGt(claims(recipient), 0);
+        uint256 refund = claims(recipient);
+        uint256 fee = hook.pending();
+        assertGt(refund, 0);
         assertEq(claims(alice), 0);
         assertEq(claims(address(router)), 0);
+
+        // Choosing a destination credits a new refund; it gives neither the payer nor the router
+        // authority over the recipient's claims. Only the recipient approves this redemption.
+        uint256 id = Currency.wrap(address(imd)).toId();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", uint256(0x11)));
+        manager.transferFrom(recipient, alice, id, refund);
+        assertEq(claims(recipient), refund);
+
+        hook.sweep();
+        assertEq(imd.balanceOf(TREASURY), fee, "treasury receives fees only");
+        assertEq(claims(recipient), refund, "sweeping fees cannot consume the recipient's refund");
+
+        RefundClaimRedeemer redeemer = new RefundClaimRedeemer(manager);
+        uint256 recipientBefore = imd.balanceOf(recipient);
+        vm.startPrank(recipient);
+        manager.approve(address(redeemer), id, refund);
+        redeemer.redeem(Currency.wrap(address(imd)), refund);
+        vm.stopPrank();
+        assertEq(imd.balanceOf(recipient) - recipientBefore, refund);
+        assertEq(claims(recipient), 0);
+        assertEq(claims(address(router)), 0);
+        assertEq(hook.collected(), fee);
+        assertEq(hook.swept(), fee);
+    }
+
+    function test_refundRecipientIsChosenIndependentlyForEachSwap() public {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        address bob = makeAddr("refundBob");
+        address carol = makeAddr("refundCarol");
+        address[4] memory recipients = [bob, carol, address(router), alice];
+
+        for (uint256 i; i < recipients.length; i++) {
+            uint256[4] memory before;
+            for (uint256 j; j < recipients.length; j++) {
+                before[j] = claims(recipients[j]);
+            }
+            uint256 oldFee = hook.pending();
+            bool buy = i % 2 == 0;
+            bool zfo = zeroForOneFor(buy);
+            (uint256 reserved,) = buy ? reservedBuy(10_000 ether, 4000) : reservedSell(10_000 ether, 4000);
+
+            vm.prank(alice);
+            router.swap(
+                key,
+                SwapParams(zfo, buy ? -int256(10_000 ether) : int256(10_000 ether), nearLimit(zfo, 5)),
+                i == 2 ? bytes("") : abi.encode(recipients[i]),
+                100_000 ether,
+                100_000 ether
+            );
+
+            uint256 refund = reserved - (hook.pending() - oldFee);
+            assertGt(refund, 0, "each swap partially fills");
+            for (uint256 j; j < recipients.length; j++) {
+                assertEq(claims(recipients[j]), before[j] + (i == j ? refund : 0), "no stale refund destination");
+            }
+        }
+    }
+
+    /// @dev Dirty high bits must not be silently truncated into a valid destination or cause an
+    ///      abi.decode revert. Compare the same trade with empty data to isolate the routing change.
+    function checkNoncanonicalRefundAddress(uint96 highBits, bool sell) internal {
+        seedBothSides();
+        DeltaSettlementRouter router = refundRouter();
+        highBits = uint96(bound(highBits, 1, type(uint96).max));
+        bool zfo = zeroForOneFor(!sell);
+        uint256 snapshot = vm.snapshotState();
+        deltaOnlySwap(router, !sell, 10_000 ether, nearLimit(zfo, 5), "");
+        uint256 expectedFee = hook.pending();
+        uint256 expectedRefund = claims(address(router));
+        uint256 expectedImd = imd.balanceOf(alice);
+        uint256 expectedSnewt = token.balanceOf(alice);
+        uint160 expectedPrice = sqrtPrice();
+        assertGt(expectedRefund, 0);
+        assertTrue(vm.revertToState(snapshot));
+
+        bytes memory data = abi.encode((uint256(highBits) << 160) | uint256(uint160(alice)));
+        deltaOnlySwap(router, !sell, 10_000 ether, nearLimit(zfo, 5), data);
+        assertEq(claims(address(router)), expectedRefund);
+        assertEq(claims(alice), 0, "noncanonical data must not select its low 160 bits");
+        assertEq(hook.pending(), expectedFee);
+        assertEq(imd.balanceOf(alice), expectedImd);
+        assertEq(token.balanceOf(alice), expectedSnewt);
+        assertEq(sqrtPrice(), expectedPrice);
     }
 
     function test_emptyZeroOrMalformedHookDataFallsBackToRouter() public {
@@ -882,9 +969,21 @@ abstract contract SNEWTHookTestBase is Test {
         assertEq(imd.balanceOf(alice), 0);
         bool zfo = zeroForOneFor(false);
         SwapParams memory params = SwapParams(zfo, 10_000 ether, nearLimit(zfo, 5));
+        uint256 snewtBefore = token.balanceOf(alice);
+        uint256 allowanceBefore = token.allowance(alice, address(router));
         vm.prank(alice);
-        vm.expectRevert();
+        // Settlement transfers IMD from the unfunded router, wrapped by Currency.transfer.
+        // CustomRevert may leave dirty ABI padding, so match the wrapper selector. Retrying the
+        // identical swap below with only IMD funding changed isolates the settlement failure.
+        vm.expectPartialRevert(CustomRevert.WrappedError.selector);
         router.swap(key, params, abi.encode(alice), tokenIs0 ? 100_000 ether : 0, tokenIs0 ? 0 : 100_000 ether);
+        assertEq(token.balanceOf(alice), snewtBefore, "failed settlement rolls back the token input");
+        assertEq(token.allowance(alice, address(router)), allowanceBefore);
+        assertEq(hook.pending(), 0);
+        assertEq(hook.collected(), 0);
+        assertEq(claims(alice), 0, "no unbacked refund survives a failed settlement");
+        assertEq(claims(address(router)), 0);
+        assertEq(sqrtPrice(), SQRT_PRICE_1_1);
         (uint256 reserved,) = reservedSell(10_000 ether, hook.feeNow());
         imd.mint(alice, reserved);
         vm.prank(alice);
@@ -1089,10 +1188,20 @@ contract SNEWTHookTokenFirstTest is SNEWTHookTestBase {
     function wantTokenFirst() internal pure override returns (bool) {
         return true;
     }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_noncanonicalRefundAddressFallsBackWithoutChangingTheTrade(uint96 highBits, bool sell) public {
+        checkNoncanonicalRefundAddress(highBits, sell);
+    }
 }
 
 contract SNEWTHookPairedFirstTest is SNEWTHookTestBase {
     function wantTokenFirst() internal pure override returns (bool) {
         return false;
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_noncanonicalRefundAddressFallsBackWithoutChangingTheTrade(uint96 highBits, bool sell) public {
+        checkNoncanonicalRefundAddress(highBits, sell);
     }
 }

@@ -16,7 +16,7 @@ import {SNEWT} from "../src/SNEWT.sol";
 import {SNEWTHook} from "../src/SNEWTHook.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {SwapRouter, LiquidityRouter} from "./utils/Routers.sol";
-import {DeltaSettlementRouter} from "./utils/DeltaSettlementRouter.sol";
+import {DeltaSettlementRouter, RefundClaimRedeemer} from "./utils/DeltaSettlementRouter.sol";
 
 interface IERC20Meta {
     function symbol() external view returns (string memory);
@@ -239,5 +239,23 @@ contract SNEWTHookForkTest is Test {
         assertEq(newRefund + fee, reserved);
         assertLe(fee, moved * bps / BPS + 2);
         assertEq(change + int256(newRefund), int256(moved - fee));
+        redeemRefundAfterSweep(refund + newRefund);
+    }
+
+    function redeemRefundAfterSweep(uint256 refund) internal {
+        uint256 due = hook.pending();
+        uint256 treasuryBefore = imd.balanceOf(TREASURY);
+        hook.sweep();
+        assertEq(imd.balanceOf(TREASURY) - treasuryBefore, due);
+        assertEq(hook.pending(), 0);
+        assertEq(manager.balanceOf(address(this), Currency.wrap(IMD).toId()), refund);
+
+        RefundClaimRedeemer redeemer = new RefundClaimRedeemer(manager);
+        uint256 before = imd.balanceOf(address(this));
+        manager.approve(address(redeemer), Currency.wrap(IMD).toId(), refund);
+        redeemer.redeem(Currency.wrap(IMD), refund);
+        assertEq(imd.balanceOf(address(this)) - before, refund, "real IMD backs the direct refund");
+        assertEq(manager.balanceOf(address(this), Currency.wrap(IMD).toId()), 0);
+        assertEq(hook.collected(), due, "redeeming a user refund does not change fee accounting");
     }
 }

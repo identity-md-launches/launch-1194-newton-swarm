@@ -20,6 +20,7 @@ import {SNEWTHook} from "../src/SNEWTHook.sol";
 import {MockERC20} from "./utils/MockERC20.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {SwapRouter, LiquidityRouter} from "./utils/Routers.sol";
+import {DeltaSettlementRouter} from "./utils/DeltaSettlementRouter.sol";
 
 /// @dev Turns an ERC-6909 claim back into tokens: what a swapper does with a hook refund.
 contract ClaimRedeemer is IUnlockCallback {
@@ -63,6 +64,7 @@ contract SNEWTHookHandler is Test {
     MockERC20 public imd;
     SNEWTHook public hook;
     SwapRouter public swapRouter;
+    DeltaSettlementRouter public directRefundRouter;
     LiquidityRouter public lpRouter;
     ClaimRedeemer public redeemer;
     PoolKey key;
@@ -78,7 +80,7 @@ contract SNEWTHookHandler is Test {
     uint256 public ghostZeroFills;
     uint256 public ghostMaxFee; // sum over swaps of bps * moved / BPS + 2 (rounding slack)
     uint256 public ghostMoved; // sum over swaps of the IMD the pool actually moved
-    uint256 public ghostRefunds; // claims minted back to swappers
+    uint256 public ghostRefunds; // claims minted to swappers or their chosen recipients
     uint256 public ghostGifted; // claims third parties handed to the hook
     uint256 public ghostSwept; // what sweep() reported delivering
     uint256 public ghostRedeemed; // claims actors turned back into IMD
@@ -103,6 +105,7 @@ contract SNEWTHookHandler is Test {
         poolId = PoolIdLibrary.toId(key_);
         tokenIs0 = Currency.unwrap(key_.currency0) == address(token_);
         swapRouter = swapRouter_;
+        directRefundRouter = new DeltaSettlementRouter(manager_);
         lpRouter = lpRouter_;
         redeemer = new ClaimRedeemer(manager_);
         imdId = Currency.wrap(address(imd_)).toId();
@@ -114,6 +117,8 @@ contract SNEWTHookHandler is Test {
             vm.startPrank(actors[i]);
             token.approve(address(swapRouter), type(uint256).max);
             imd.approve(address(swapRouter), type(uint256).max);
+            token.approve(address(directRefundRouter), type(uint256).max);
+            imd.approve(address(directRefundRouter), type(uint256).max);
             vm.stopPrank();
         }
         token.approve(address(lpRouter), type(uint256).max);
@@ -175,6 +180,8 @@ contract SNEWTHookHandler is Test {
 
     struct Snap {
         address actor;
+        address recipient;
+        bool directRefund;
         bool buy;
         bool exactInput;
         uint256 amount;
@@ -184,6 +191,7 @@ contract SNEWTHookHandler is Test {
         uint256 pending;
         uint256 collected;
         uint256 claims;
+        uint256 payerClaims;
         int256 imdBalance;
         uint256 tokBalance;
     }
@@ -194,33 +202,77 @@ contract SNEWTHookHandler is Test {
     {
         Snap memory s;
         s.actor = _actor(actorSeed);
+        s.recipient = s.actor;
         s.buy = buy;
         s.exactInput = exactInput;
         s.amount = bound(amount, 1, MAX_SWAP);
-        bool zeroForOne = _zeroForOne(buy);
+        _swap(s, useLimit, sqrtBps);
+    }
+
+    /// @notice Interleave direct refunds to independent actors with legacy swaps, redemption,
+    ///         gifts and sweeps. The delta-only router cannot forward or redeem any claims.
+    function swapWithRecipient(
+        uint256 actorSeed,
+        uint256 recipientSeed,
+        bool buy,
+        bool exactInput,
+        uint256 amount,
+        uint16 sqrtBps
+    ) external {
+        Snap memory s;
+        s.actor = _actor(actorSeed);
+        s.recipient = _actor(recipientSeed);
+        s.directRefund = true;
+        s.buy = buy;
+        s.exactInput = exactInput;
+        s.amount = bound(amount, 1, MAX_SWAP);
+        _swap(s, true, uint16(bound(sqrtBps, 1, 100)));
+    }
+
+    function _swap(Snap memory s, bool useLimit, uint16 sqrtBps) internal {
+        bool zeroForOne = _zeroForOne(s.buy);
         uint160 limit = _limit(zeroForOne, useLimit, bound(sqrtBps, 1, 2_000));
         if (limit == 0) return;
 
         s.bps = hook.feeNow();
-        if (buy == exactInput) (s.reserved, s.expected) = _reserved(buy, s.amount, s.bps);
+        if (s.buy == s.exactInput) (s.reserved, s.expected) = _reserved(s.buy, s.amount, s.bps);
         s.pending = hook.pending();
         s.collected = hook.collected();
-        s.claims = manager.balanceOf(s.actor, imdId);
+        s.claims = manager.balanceOf(s.recipient, imdId);
+        s.payerClaims = manager.balanceOf(s.actor, imdId);
         s.imdBalance = int256(imd.balanceOf(s.actor));
         s.tokBalance = token.balanceOf(s.actor);
 
         vm.prank(s.actor);
-        swapRouter.swap(key, SwapParams(zeroForOne, exactInput ? -int256(s.amount) : int256(s.amount), limit));
+        SwapParams memory params = SwapParams(zeroForOne, s.exactInput ? -int256(s.amount) : int256(s.amount), limit);
+        if (s.directRefund) {
+            uint256 imdBudget = uint256(s.imdBalance);
+            directRefundRouter.swap(
+                key,
+                params,
+                abi.encode(s.recipient),
+                tokenIs0 ? s.tokBalance : imdBudget,
+                tokenIs0 ? imdBudget : s.tokBalance
+            );
+        } else {
+            swapRouter.swap(key, params);
+        }
 
         _verify(s);
     }
 
     function _verify(Snap memory s) internal {
         uint256 fee = hook.pending() - s.pending;
-        uint256 refund = manager.balanceOf(s.actor, imdId) - s.claims;
+        uint256 refund = manager.balanceOf(s.recipient, imdId) - s.claims;
         int256 change = int256(imd.balanceOf(s.actor)) - s.imdBalance;
         assertEq(hook.collected() - s.collected, fee, "collected tracks pending");
         assertEq(manager.balanceOf(address(swapRouter), imdId), 0, "router forwarded every claim");
+        assertEq(manager.balanceOf(address(directRefundRouter), imdId), 0, "direct refund bypassed the router");
+        assertEq(imd.balanceOf(address(directRefundRouter)), 0, "unused IMD returned to payer");
+        assertEq(token.balanceOf(address(directRefundRouter)), 0, "unused SNEWT returned to payer");
+        if (s.recipient != s.actor) {
+            assertEq(manager.balanceOf(s.actor, imdId), s.payerClaims, "only the chosen recipient gets the refund");
+        }
 
         // The IMD the pool itself moved, reconstructed from the swapper's side.
         uint256 moved;
@@ -344,13 +396,15 @@ contract SNEWTHookHandler is Test {
             total += manager.balanceOf(actors[i], imdId);
         }
         total += manager.balanceOf(address(swapRouter), imdId);
+        total += manager.balanceOf(address(directRefundRouter), imdId);
         total += manager.balanceOf(address(lpRouter), imdId);
         total += manager.balanceOf(address(redeemer), imdId);
     }
 
     function snewtHeldByEveryone() external view returns (uint256 total) {
         total = token.balanceOf(address(this)) + token.balanceOf(address(manager)) + token.balanceOf(address(hook))
-            + token.balanceOf(address(swapRouter)) + token.balanceOf(address(lpRouter));
+            + token.balanceOf(address(swapRouter)) + token.balanceOf(address(lpRouter))
+            + token.balanceOf(address(directRefundRouter));
         for (uint256 i = 0; i < actors.length; i++) {
             total += token.balanceOf(actors[i]);
         }
@@ -438,7 +492,7 @@ contract SNEWTHookInvariantTest is Test {
         lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-887_220, 887_220, int256(SEED_LIQUIDITY), bytes32(0)));
 
         targetContract(address(d.handler));
-        bytes4[] memory selectors = new bytes4[](7);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = SNEWTHookHandler.swap.selector;
         selectors[1] = SNEWTHookHandler.warp.selector;
         selectors[2] = SNEWTHookHandler.sweep.selector;
@@ -446,6 +500,7 @@ contract SNEWTHookInvariantTest is Test {
         selectors[4] = SNEWTHookHandler.redeem.selector;
         selectors[5] = SNEWTHookHandler.addLiquidity.selector;
         selectors[6] = SNEWTHookHandler.removeLiquidity.selector;
+        selectors[7] = SNEWTHookHandler.swapWithRecipient.selector;
         targetSelector(FuzzSelector({addr: address(d.handler), selectors: selectors}));
 
         deployments.push(d);

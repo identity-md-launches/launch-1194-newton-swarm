@@ -358,9 +358,9 @@ abstract contract SNEWTHookEdgeBase is Test {
 
     // ------------------------------------------------------------------ routers and refunds
 
-    function test_refundIsMintedToTheRouterNotTheEndUser() public {
-        // The hook can only see the PoolManager's caller. A router that does not forward claims keeps
-        // the user's refund: integrators must use a claim-aware router for price-limited swaps.
+    function test_emptyHookDataKeepsLegacyRouterRefundDestination() public {
+        // Empty hookData retains the legacy fallback. Routers can now supply abi.encode(recipient)
+        // to deliver a refund directly; this fixture deliberately sends no recipient.
         seedBothSides();
         NaiveRouter naive = new NaiveRouter(manager);
         imd.transfer(alice, 100_000 ether);
