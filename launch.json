@@ -1,0 +1,27 @@
+{
+  "kind": "univ4_hook",
+  "token": {
+    "contract": "SNEWT",
+    "name": "Newton Swarm",
+    "symbol": "SNEWT",
+    "decimals": 18
+  },
+  "hook": {
+    "contract": "SNEWTHook",
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SNEWTHook(IPoolManager manager, address launchToken): $poolManager is the chain's Uniswap v4 PoolManager (0x8366a39cc670b4001a1121b8f6a443a643e40951 on Robinhood Chain) and $token is the SNEWT token the factory deploys just before the hook; the constructor makes no external call. The treasury 0x5f948c351eb9f0734c28b605bbeee9ab9d04318e is a compile-time constant. The hook address must carry exactly the permission bits beforeInitialize (1<<13), beforeSwap (1<<7), afterSwap (1<<6), beforeSwapReturnDelta (1<<3) and afterSwapReturnDelta (1<<2), i.e. address & 0x3FFF == 0x20CC; the constructor reverts with HookAddressNotValid otherwise, so the CREATE2 salt must be mined for that mask. beforeInitialize accepts one pool only: the launch token against any paired currency at LP fee 12500 and tick spacing 60, and records the opening time. Fees: the pool keeps its static 1.25% LP fee (never dynamic, never overridden); on top of it the hook takes a fee in the paired currency (IMD) on every swap, 4000 bps at initialization decreasing linearly with block.timestamp to 300 bps over 60 minutes and 300 bps forever after, always proportional to the IMD that actually moved through the pool (taken in afterSwap on the unspecified side, or reserved in beforeSwap on the specified side and reconciled in afterSwap with the excess refunded to the swap sender as an ERC-6909 claim). The fee accrues as the hook's ERC-6909 claim on the PoolManager; sweep(), callable by anyone, delivers all of it to the treasury. Views: feeNow(), openedAt(), pending(), collected(), swept(). No owner, no setters, no proxy, no delegatecall, no selfdestruct."
+}
