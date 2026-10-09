@@ -1,0 +1,53 @@
+{
+  "valid": true,
+  "images": [
+    {
+      "path": "logos/logo-1.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 1071825,
+      "sha256": "ddd21612f70d74a693f3cb2f6b9d54e74c84f9f0dcf6a4c864f1423db240ad94"
+    },
+    {
+      "path": "logos/logo-2.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 820738,
+      "sha256": "ae651db2fa896e27b8b99353ffec0efee47aaf7f4a449c5cc37103ec6f5803b3"
+    },
+    {
+      "path": "logos/logo-3.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 1039284,
+      "sha256": "60f527b45b8f69a7f92514af8dc074d7555d724be8cfde6233661f646d1342b6"
+    },
+    {
+      "path": "logos/logo-4.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 1690422,
+      "sha256": "233d196bc8e91f5e6b482a2b89c299421d72cb513c74c63e698424033a1f3095"
+    },
+    {
+      "path": "logos/logo-5.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 1401688,
+      "sha256": "b8209b3b161464e4c7dab9d629d71d9a64c06de064e11882405a50079cac1675"
+    },
+    {
+      "path": "artifacts/logo.png",
+      "width": 1024,
+      "height": 1024,
+      "opaque": true,
+      "bytes": 820738,
+      "sha256": "ae651db2fa896e27b8b99353ffec0efee47aaf7f4a449c5cc37103ec6f5803b3"
+    }
+  ]
+}

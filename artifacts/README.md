@@ -1,0 +1,6 @@
+- `logo.png`: selected primary wallet logo, identical to `../logos/logo-2.png`; 1024×1024 opaque RGB PNG, drawn with OpenAI's built-in image generation tool.
+- All five generated designs are delivered in `../logos/logo-1.png` through `../logos/logo-5.png`; redundant 1254×1254 intermediate renders were removed to meet the 8 MiB upload limit. No design was discarded or redrawn.
+- `reference.png`: downloaded creator-provided reference, used for the character concept and palette.
+- `size-check.png`: inspection sheet only, assembled from the finished logos; columns 1–5, rows 160px, 64px light, 64px dark, and 32px circular crops on both backgrounds.
+- `validation.json`: reproducible file checks and SHA-256 hashes from `python3 scripts/check_logos.py`; original artwork was only resized and encoded, never drawn by code.
+- `compression.json`: lossless PNG compression results, including byte counts and decoded RGB hashes; all delivered images retain exactly the same pixels as before this size repair.

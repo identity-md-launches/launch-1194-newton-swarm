@@ -1,0 +1,17 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+cache_path = "cache"
+libs = []
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+offline = true
+ffi = false
+fs_permissions = [
+  { access = "read", path = "./logos" },
+  { access = "read", path = "./artifacts" }
+]

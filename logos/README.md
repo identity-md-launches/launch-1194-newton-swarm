@@ -1,0 +1,5 @@
+- **logo-1.png — Mascot:** a friendly green amphibian scholar with a white curled wig and purple-and-gold coat on cobalt blue.
+- **logo-2.png — Geometric icon:** a simplified green face and white wig with broad shapes; selected as the primary wallet logo in `artifacts/logo.png`.
+- **logo-3.png — Lettermark:** bold green-and-gold `SNEWT` lettering integrated with the scholar's eyes, wig and purple smile.
+- **logo-4.png — Coin emblem:** a sculpted green scholar cameo in cobalt enamel and a warm gold minted rim.
+- **logo-5.png — Meme illustration:** an exaggerated, energetic scholar face with comic motion and the same green, white, purple, blue and gold palette.

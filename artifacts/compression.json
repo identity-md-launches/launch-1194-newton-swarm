@@ -1,0 +1,83 @@
+{
+  "method": "Lossless PNG re-encoding with FFmpeg, mixed prediction and compression level 9; decoded RGB bytes compared before replacing each file.",
+  "images": [
+    {
+      "path": "logos/logo-1.png",
+      "beforeBytes": 1434287,
+      "afterBytes": 1071825,
+      "decodedRgbSha256": "91b5e9cefd5c90390748b951a5faff0e11f4ae0113e4d971c9c328b8b31f0e0f",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "logos/logo-2.png",
+      "beforeBytes": 991469,
+      "afterBytes": 820738,
+      "decodedRgbSha256": "7c2e0361b688ec84e48e3e836a712b7eb3c7e13a63b88865652f926361629b3c",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "logos/logo-3.png",
+      "beforeBytes": 1360329,
+      "afterBytes": 1039284,
+      "decodedRgbSha256": "a35a8fdb4c2f2efc69fda95f64200a04bc1c641272b43f2b2b842b020dbdcb51",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "logos/logo-4.png",
+      "beforeBytes": 2267056,
+      "afterBytes": 1690422,
+      "decodedRgbSha256": "d8a87fd5de419749cc6966e6bde3919b864dd88cce13f65f43e01d9cf16ac7a6",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "logos/logo-5.png",
+      "beforeBytes": 1838291,
+      "afterBytes": 1401688,
+      "decodedRgbSha256": "2fe3e5d32348916e74ed487b9c36af5d957696a0b352f892805bf8ace232799f",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "artifacts/reference.png",
+      "beforeBytes": 864744,
+      "afterBytes": 864744,
+      "decodedRgbSha256": "203730cb588a5651a690261f8b388f3ad4dcf98e98445ec21ab68e49fe878456",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "artifacts/size-check.png",
+      "beforeBytes": 374077,
+      "afterBytes": 346333,
+      "decodedRgbSha256": "0aa73772ba1ccf956ca0cf73e20cfa38262d25a1293aba8cd2414e70869ba3e9",
+      "pixelsIdentical": true
+    },
+    {
+      "path": "artifacts/logo.png",
+      "beforeBytes": 991469,
+      "afterBytes": 820738,
+      "decodedRgbSha256": "7c2e0361b688ec84e48e3e836a712b7eb3c7e13a63b88865652f926361629b3c",
+      "pixelsIdentical": true
+    }
+  ],
+  "removedRedundantOriginals": [
+    {
+      "path": "artifacts/generated-mascot.png",
+      "bytes": 1672198
+    },
+    {
+      "path": "artifacts/generated-geometric.png",
+      "bytes": 1382252
+    },
+    {
+      "path": "artifacts/generated-lettermark.png",
+      "bytes": 1640639
+    },
+    {
+      "path": "artifacts/generated-emblem.png",
+      "bytes": 2514757
+    },
+    {
+      "path": "artifacts/generated-meme.png",
+      "bytes": 2016488
+    }
+  ]
+}
